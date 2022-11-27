@@ -46,11 +46,14 @@ class ConstantPredictor:
 class BaseEstimatorUtils:
     def __init__(
             self,
-            random_state: int = 42
+            random_state: int = 42,
+            trace_loss: bool = False
     ):
         self.random_state = random_state
         self.train_loss_ = []
         self.val_loss_ = None
+
+        self.trace_loss_ = trace_loss
 
         self._val_used = False
         self._fitted = False
@@ -64,10 +67,20 @@ class BaseEstimatorUtils:
         return self._fitted
 
     def append_train_loss(self, loss_value):
-        self.train_loss_.append(loss_value)
+        """Adds loss on train data to the storage array
+        """
+        if isinstance(loss_value, float):
+            self.train_loss_.append(loss_value)
+        else:
+            self.train_loss_.extend(loss_value)
 
     def append_val_loss(self, loss_value):
+        """Adds loss on validation data to the storage array
+        """
         if self.val_loss_ is None:
             self.val_loss_ = []
             self._val_used = True
-        self.val_loss_.append(loss_value)
+        if isinstance(loss_value, float):
+            self.val_loss_.append(loss_value)
+        else:
+            self.val_loss_.extend(loss_value)
