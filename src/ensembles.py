@@ -1,50 +1,58 @@
 import threading
-from typing import Union, Literal, Any
+from typing import Union, Literal
 
 import numpy as np
 from joblib import Parallel, delayed
 from scipy.optimize import minimize_scalar
 from sklearn.tree import DecisionTreeRegressor
 
+from base_estimators import ConstantPredictor
 
-class ConstantPredictor:
-    def __init__(
-            self,
-            method: str = 'mean'
-    ):
-        self.method = method
-        if self.method not in {'mean', 'zero'}:
-            raise ValueError(f'Expected "method" to be one of {"mean", "zero"}, '
-                             f'got {method}')
-        self._pred_val = None
-        self._fitted = False
 
-    def fit(
-            self,
-            *,
-            y: Any = None
-    ):
-        """
-        :param y: target vector, needed if method is 'mean'
-        :return: fitted ConstantPredictor object
-        """
-        if (self.method == 'mean') and (y is None):
-            raise ValueError('"mean" method is not supported if y is None')
-        if self.method == 'mean':
-            self._pred_val = y.mean()
-        elif self.method == 'zero':
-            self._pred_val = 0.
-        self._fitted = True
-        return self
+class BootstrappedTrees:
+    """Holder for trees and their feature and object subspaces
+    """
 
-    def predict(self, X):
+    def __init__(self):
+        self.trees_ = []
+        self.bags_ = []
+        self.subspaces_ = []
+
+    @property
+    def trees(self):
+        """Getter for 'trees' field
         """
-        :param X: Used to determine the length of prediction vector
-        :return: constant-valued prediction vector
+        return self.trees_
+
+    @trees.setter
+    def trees(self, value):
+        """Setter for 'trees' field
         """
-        if not self._fitted:
-            raise RuntimeError('Estimator is not fitted')
-        return np.full(X.shape[0], self._pred_val)
+        self.trees_ = value
+
+    @property
+    def bags(self):
+        """Getter for 'bags' field
+        """
+        return self.bags_
+
+    @bags.setter
+    def bags(self, value):
+        """Setter for 'bags' field
+        """
+        self.bags_ = value
+
+    @property
+    def subspaces(self):
+        """Getter for 'subspaces' field
+        """
+        return self.subspaces_
+
+    @subspaces.setter
+    def subspaces(self, value):
+        """Setter for 'subspaces' field
+        """
+        self.subspaces_ = value
 
 
 class BaseTreeEnsemble:
@@ -71,9 +79,7 @@ class BaseTreeEnsemble:
                              f'got {feature_subsample_size}')
         self.max_samples = max_samples
 
-        self._trees = None
-        self._bags = None
-        self._subspaces = None
+        self.estimators_ = BootstrappedTrees()
 
     def _set_params_fit(self, X):
         if self.random_state is not None:
@@ -97,13 +103,13 @@ class BaseTreeEnsemble:
         else:
             bag_size = int(self.max_samples * X.shape[0])
 
-        self._bags = np.random.choice(
+        self.estimators_.bags = np.random.choice(
             X.shape[0],
             (self.n_estimators, bag_size),
             replace=True
         )
 
-        self._subspaces = [np.random.choice(
+        self.estimators_.subspaces = [np.random.choice(
             X.shape[1],
             self.feature_subsample_size,
             replace=False
@@ -170,11 +176,10 @@ class RandomForestMSE(BaseTreeEnsemble):
         self.n_jobs = n_jobs
 
     def _fit_tree(self, X, y, idx):
-        self._trees[idx].fit(
-            X.take(self._bags[idx], 0).take(self._subspaces[idx], 1),
-            y[self._bags[idx]]
+        self.estimators_.trees[idx].fit(
+            X.take(self.estimators_.bags[idx], 0).take(self.estimators_.subspaces[idx], 1),
+            y[self.estimators_.bags[idx]]
         )
-        return self._trees[idx]
 
     def fit(self, X, y, X_val=None, y_val=None):
         """
@@ -189,12 +194,12 @@ class RandomForestMSE(BaseTreeEnsemble):
         """
         self._set_params_fit(X)
 
-        self._trees = [self.base_tree_(
+        self.estimators_.trees = [self.base_tree_(
             **self.trees_parameters,
             random_state=np.random.randint(np.iinfo(np.int32).max)
         ) for _ in range(self.n_estimators)]
 
-        self._trees = Parallel(
+        Parallel(
             n_jobs=self.n_jobs,
             prefer='threads',
         )(delayed(self._fit_tree)(X, y, idx) for idx in range(self.n_estimators))
@@ -224,10 +229,10 @@ class RandomForestMSE(BaseTreeEnsemble):
             require='sharedmem'
         )(delayed(self._parallel_predict)(
             tree.predict,
-            X.take(self._subspaces[idx], 1),
+            X.take(self.estimators_.subspaces[idx], 1),
             [pred],
             lock
-        ) for idx, tree in enumerate(self._trees))
+        ) for idx, tree in enumerate(self.estimators_.trees))
 
         pred /= self.n_estimators
         return pred
@@ -281,19 +286,19 @@ class GradientBoostingMSE(BaseTreeEnsemble):
         self._set_params_fit(X)
 
         self._const_pred = ConstantPredictor('mean').fit(y=y)
-        self._trees = [self.base_tree_(**self.trees_parameters)
-                       for _ in range(self.n_estimators)]
+        self.estimators_.trees = [self.base_tree_(**self.trees_parameters)
+                                  for _ in range(self.n_estimators)]
         self._weights = np.ones(self.n_estimators, dtype=np.float64)
 
         curr_target = self._const_pred.predict(X)
 
         for idx in range(self.n_estimators):
-            self._trees[idx].fit(
-                X.take(self._bags[idx], 0).take(self._subspaces[idx], 1),
-                (y - curr_target)[self._bags[idx]]
+            self.estimators_.trees[idx].fit(
+                X.take(self.estimators_.bags[idx], 0).take(self.estimators_.subspaces[idx], 1),
+                (y - curr_target)[self.estimators_.bags[idx]]
             )
 
-            pred = self._trees[idx].predict(X.take(self._subspaces[idx], 1))
+            pred = self.estimators_.trees[idx].predict(X.take(self.estimators_.subspaces[idx], 1))
 
             self._weights[idx] = minimize_scalar(
                 lambda x, prediction, target: np.linalg.norm(
@@ -320,8 +325,8 @@ class GradientBoostingMSE(BaseTreeEnsemble):
         tree_preds = np.array([tree.predict(
             X.take(subspace, 1)
         ) for subspace, tree in zip(
-            self._subspaces,
-            self._trees
+            self.estimators_.subspaces,
+            self.estimators_.trees
         )])
 
         return self._const_pred.predict(X) + self.learning_rate * np.dot(self._weights, tree_preds)
