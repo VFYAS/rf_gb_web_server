@@ -6,7 +6,7 @@ from joblib import Parallel, delayed
 from scipy.optimize import minimize_scalar
 from sklearn.tree import DecisionTreeRegressor
 
-from .base_estimators import ConstantPredictor, BaseEstimatorUtils
+from base_estimators import ConstantPredictor, BaseEstimatorUtils
 
 
 class BootstrappedTrees:
@@ -64,9 +64,10 @@ class BaseTreeEnsemble(BaseEstimatorUtils):
             base_tree,
             feature_subsample_size,
             max_samples,
+            trace_loss: bool = False,
             **trees_parameters
     ):
-        super().__init__(random_state=random_state)
+        super().__init__(random_state=random_state, trace_loss=trace_loss)
         if n_estimators <= 0:
             raise ValueError(f'n_trees should be positive integer, got {n_estimators}')
         self.n_estimators = n_estimators
@@ -154,6 +155,7 @@ class RandomForestMSE(BaseTreeEnsemble):
             max_samples: Union[Literal['auto'], float] = 'auto',
             random_state: int = 42,
             n_jobs: Union[None, int] = None,
+            trace_loss: bool = False,
             **trees_parameters
     ):
         """
@@ -171,9 +173,38 @@ class RandomForestMSE(BaseTreeEnsemble):
             base_tree=DecisionTreeRegressor,
             feature_subsample_size=feature_subsample_size,
             max_samples=max_samples,
+            trace_loss=trace_loss,
             **trees_parameters
         )
         self.n_jobs = n_jobs
+
+    @staticmethod
+    def _parallel_predict(pred_fn, X, out, lock, partial=False):
+        pred = pred_fn(X)
+        with lock:
+            if not partial:
+                out[0] += pred
+            else:
+                out.append(pred)
+
+    def _partial_predictions(self, X):
+        self._check_if_fitted()
+
+        pred = []
+        lock = threading.Lock()
+        Parallel(
+            n_jobs=self.n_jobs,
+            prefer='threads',
+            require='sharedmem'
+        )(delayed(self._parallel_predict)(
+            tree.predict,
+            X.take(self.estimators_.subspaces[idx], 1),
+            pred,
+            lock,
+            True
+        ) for idx, tree in enumerate(self.estimators_.trees))
+
+        return np.cumsum(pred, axis=0) / np.arange(1, self.n_estimators + 1)[:, None]
 
     def _fit_tree(self, X, y, idx):
         self.estimators_.trees[idx].fit(
@@ -205,13 +236,18 @@ class RandomForestMSE(BaseTreeEnsemble):
             prefer='threads',
         )(delayed(self._fit_tree)(X, y, idx) for idx in range(self.n_estimators))
 
-        return self
+        if self.trace_loss_:
+            train_diff = self._partial_predictions(X) - y
+            self.append_train_loss(
+                1 / X.shape[0] * np.linalg.norm(train_diff, axis=1) ** 2
+            )
+            if (X_val is not None) and (y_val is not None):
+                val_diff = self._partial_predictions(X_val) - y
+                self.append_val_loss(
+                    1 / X_val.shape[0] * np.linalg.norm(val_diff, axis=1) ** 2
+                )
 
-    @staticmethod
-    def _parallel_predict(pred_fn, X, out, lock):
-        pred = pred_fn(X)
-        with lock:
-            out[0] += pred
+        return self
 
     def predict(self, X):
         """
@@ -251,6 +287,7 @@ class GradientBoostingMSE(BaseTreeEnsemble):
             feature_subsample_size: Union[Literal['auto'], float] = 'auto',
             max_samples: float = 1.,
             random_state: int = 42,
+            trace_loss: bool = False,
             **trees_parameters
     ):
         """
@@ -271,11 +308,12 @@ class GradientBoostingMSE(BaseTreeEnsemble):
             feature_subsample_size=feature_subsample_size,
             max_samples=max_samples,
             max_depth=max_depth,
+            trace_loss=trace_loss,
             **trees_parameters
         )
 
         self.learning_rate = learning_rate
-        self._weights = None
+        self._weights = []
         self._const_pred = None
 
     def fit(self, X, y, X_val=None, y_val=None):
@@ -289,13 +327,11 @@ class GradientBoostingMSE(BaseTreeEnsemble):
         self._set_fitted()
 
         self._const_pred = ConstantPredictor('mean').fit(y=y)
-        self.estimators_.trees = [self.base_tree_(**self.trees_parameters)
-                                  for _ in range(self.n_estimators)]
-        self._weights = np.ones(self.n_estimators, dtype=np.float64)
 
         curr_target = self._const_pred.predict(X)
 
         for idx in range(self.n_estimators):
+            self.estimators_.trees.append(self.base_tree_(**self.trees_parameters))
             self.estimators_.trees[idx].fit(
                 X.take(self.estimators_.bags[idx], 0).take(self.estimators_.subspaces[idx], 1),
                 (y - curr_target)[self.estimators_.bags[idx]]
@@ -303,15 +339,26 @@ class GradientBoostingMSE(BaseTreeEnsemble):
 
             pred = self.estimators_.trees[idx].predict(X.take(self.estimators_.subspaces[idx], 1))
 
-            self._weights[idx] = minimize_scalar(
+            self._weights.append(minimize_scalar(
                 lambda x, prediction, target: np.linalg.norm(
                     target + x * prediction - y
                 ),
                 bounds=(0,),
                 args=(pred, curr_target)
-            ).x
+            ).x)
 
             curr_target = curr_target + self.learning_rate * self._weights[idx] * pred
+
+            if self.trace_loss_:
+                diff = self.predict(X) - y
+                self.append_train_loss(
+                    1 / X.shape[0] * np.inner(diff, diff)
+                )
+                if (X_val is not None) and (y_val is not None):
+                    diff = self.predict(X_val) - y_val
+                    self.append_val_loss(
+                        1 / X_val.shape[0] * np.inner(diff, diff)
+                    )
 
         return self
 
