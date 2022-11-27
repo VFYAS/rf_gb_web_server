@@ -6,7 +6,7 @@ from joblib import Parallel, delayed
 from scipy.optimize import minimize_scalar
 from sklearn.tree import DecisionTreeRegressor
 
-from base_estimators import ConstantPredictor
+from .base_estimators import ConstantPredictor, BaseEstimatorUtils
 
 
 class BootstrappedTrees:
@@ -55,7 +55,7 @@ class BootstrappedTrees:
         self.subspaces_ = value
 
 
-class BaseTreeEnsemble:
+class BaseTreeEnsemble(BaseEstimatorUtils):
     def __init__(
             self,
             n_estimators,
@@ -66,10 +66,10 @@ class BaseTreeEnsemble:
             max_samples,
             **trees_parameters
     ):
+        super().__init__(random_state=random_state)
         if n_estimators <= 0:
             raise ValueError(f'n_trees should be positive integer, got {n_estimators}')
         self.n_estimators = n_estimators
-        self.random_state = random_state
         self.base_tree_ = base_tree
         self.trees_parameters = trees_parameters
         self.feature_subsample_size = feature_subsample_size
@@ -193,6 +193,7 @@ class RandomForestMSE(BaseTreeEnsemble):
             Array of size n_val_objects
         """
         self._set_params_fit(X)
+        self._set_fitted()
 
         self.estimators_.trees = [self.base_tree_(
             **self.trees_parameters,
@@ -221,6 +222,8 @@ class RandomForestMSE(BaseTreeEnsemble):
         y : numpy ndarray
             Array of size n_objects
         """
+        self._check_if_fitted()
+
         pred = np.zeros((X.shape[0]), dtype=np.float64)
         lock = threading.Lock()
         Parallel(
@@ -282,8 +285,8 @@ class GradientBoostingMSE(BaseTreeEnsemble):
         y : numpy ndarray
             Array of size n_objects
         """
-
         self._set_params_fit(X)
+        self._set_fitted()
 
         self._const_pred = ConstantPredictor('mean').fit(y=y)
         self.estimators_.trees = [self.base_tree_(**self.trees_parameters)
@@ -321,6 +324,7 @@ class GradientBoostingMSE(BaseTreeEnsemble):
         y : numpy ndarray
             Array of size n_objects
         """
+        self._check_if_fitted()
 
         tree_preds = np.array([tree.predict(
             X.take(subspace, 1)
