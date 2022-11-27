@@ -1,1 +1,1 @@
-# rf_gb_web_server
+# Web server with interface for RandomForest and GradientBoosting regression algorithms
