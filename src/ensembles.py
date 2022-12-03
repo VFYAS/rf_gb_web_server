@@ -1,4 +1,5 @@
 import threading
+import time
 from typing import Union, Literal
 
 import numpy as np
@@ -65,9 +66,14 @@ class BaseTreeEnsemble(BaseEstimatorUtils):
             feature_subsample_size,
             max_samples,
             trace_loss: bool = False,
+            trace_time: bool = False,
             **trees_parameters
     ):
-        super().__init__(random_state=random_state, trace_loss=trace_loss)
+        super().__init__(
+            random_state=random_state,
+            trace_loss=trace_loss,
+            trace_time=trace_time
+        )
         if n_estimators <= 0:
             raise ValueError(f'n_trees should be positive integer, got {n_estimators}')
         self.n_estimators = n_estimators
@@ -156,6 +162,7 @@ class RandomForestMSE(BaseTreeEnsemble):
             random_state: int = 42,
             n_jobs: Union[None, int] = None,
             trace_loss: bool = False,
+            trace_time: bool = False,
             **trees_parameters
     ):
         """
@@ -174,6 +181,7 @@ class RandomForestMSE(BaseTreeEnsemble):
             feature_subsample_size=feature_subsample_size,
             max_samples=max_samples,
             trace_loss=trace_loss,
+            trace_time=trace_time,
             **trees_parameters
         )
         self.n_jobs = n_jobs
@@ -206,11 +214,20 @@ class RandomForestMSE(BaseTreeEnsemble):
 
         return np.cumsum(pred, axis=0) / np.arange(1, self.n_estimators + 1)[:, None]
 
-    def _fit_tree(self, X, y, idx):
+    def _fit_tree(self, X, y, idx, lock=None):
+        t0 = time.time()
         self.estimators_.trees[idx].fit(
             X.take(self.estimators_.bags[idx], 0).take(self.estimators_.subspaces[idx], 1),
             y[self.estimators_.bags[idx]]
         )
+        t0 = time.time() - t0
+
+        if self.trace_time_:
+            if lock is not None:
+                with lock:
+                    self.append_time_(t0)
+            else:
+                raise ValueError('Expected Lock object to trace time')
 
     def fit(self, X, y, X_val=None, y_val=None):
         """
@@ -231,20 +248,21 @@ class RandomForestMSE(BaseTreeEnsemble):
             random_state=np.random.randint(np.iinfo(np.int32).max)
         ) for _ in range(self.n_estimators)]
 
+        lock = threading.Lock() if self.trace_time_ else None
         Parallel(
             n_jobs=self.n_jobs,
             prefer='threads',
-        )(delayed(self._fit_tree)(X, y, idx) for idx in range(self.n_estimators))
+        )(delayed(self._fit_tree)(X, y, idx, lock) for idx in range(self.n_estimators))
 
         if self.trace_loss_:
             train_diff = self._partial_predictions(X) - y
             self.append_train_loss(
-                1 / X.shape[0] * np.linalg.norm(train_diff, axis=1) ** 2
+                np.sqrt(np.mean(train_diff ** 2, axis=1))
             )
             if (X_val is not None) and (y_val is not None):
-                val_diff = self._partial_predictions(X_val) - y
+                val_diff = self._partial_predictions(X_val) - y_val
                 self.append_val_loss(
-                    1 / X_val.shape[0] * np.linalg.norm(val_diff, axis=1) ** 2
+                    np.sqrt(np.mean(val_diff ** 2, axis=1))
                 )
 
         return self
@@ -288,6 +306,7 @@ class GradientBoostingMSE(BaseTreeEnsemble):
             max_samples: float = 1.,
             random_state: int = 42,
             trace_loss: bool = False,
+            trace_time: bool = False,
             **trees_parameters
     ):
         """
@@ -309,12 +328,27 @@ class GradientBoostingMSE(BaseTreeEnsemble):
             max_samples=max_samples,
             max_depth=max_depth,
             trace_loss=trace_loss,
+            trace_time=trace_time,
             **trees_parameters
         )
 
         self.learning_rate = learning_rate
         self._weights = []
         self._const_pred = None
+
+    def _partial_predictions(self, X):
+        self._check_if_fitted()
+
+        tree_preds = [tree.predict(
+            X.take(subspace, 1)
+        ) for subspace, tree in zip(
+            self.estimators_.subspaces,
+            self.estimators_.trees
+        )]
+
+        return self._const_pred.predict(X) + self.learning_rate \
+            * np.cumsum(np.multiply(np.array(self._weights)[:, None],
+                                    tree_preds), axis=0)
 
     def fit(self, X, y, X_val=None, y_val=None):
         """
@@ -331,11 +365,17 @@ class GradientBoostingMSE(BaseTreeEnsemble):
         curr_target = self._const_pred.predict(X)
 
         for idx in range(self.n_estimators):
+            t0 = time.time() if self.trace_time_ else None
+
             self.estimators_.trees.append(self.base_tree_(**self.trees_parameters))
             self.estimators_.trees[idx].fit(
                 X.take(self.estimators_.bags[idx], 0).take(self.estimators_.subspaces[idx], 1),
                 (y - curr_target)[self.estimators_.bags[idx]]
             )
+
+            if self.trace_time_:
+                t0 = time.time() - t0
+                self.append_time_(t0)
 
             pred = self.estimators_.trees[idx].predict(X.take(self.estimators_.subspaces[idx], 1))
 
@@ -349,16 +389,16 @@ class GradientBoostingMSE(BaseTreeEnsemble):
 
             curr_target = curr_target + self.learning_rate * self._weights[idx] * pred
 
-            if self.trace_loss_:
-                diff = self.predict(X) - y
-                self.append_train_loss(
-                    1 / X.shape[0] * np.inner(diff, diff)
+        if self.trace_loss_:
+            train_diff = self._partial_predictions(X) - y
+            self.append_train_loss(
+                np.sqrt(np.mean(train_diff ** 2, axis=1))
+            )
+            if (X_val is not None) and (y_val is not None):
+                val_diff = self._partial_predictions(X_val) - y_val
+                self.append_val_loss(
+                    np.sqrt(np.mean(val_diff ** 2, axis=1))
                 )
-                if (X_val is not None) and (y_val is not None):
-                    diff = self.predict(X_val) - y_val
-                    self.append_val_loss(
-                        1 / X_val.shape[0] * np.inner(diff, diff)
-                    )
 
         return self
 
