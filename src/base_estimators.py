@@ -47,15 +47,17 @@ class BaseEstimatorUtils:
     def __init__(
             self,
             random_state: int = 42,
-            trace_loss: bool = False
+            trace_loss: bool = False,
+            trace_time: bool = False
     ):
         self.random_state = random_state
+        self.trace_loss_ = trace_loss
+        self.trace_time_ = trace_time
+
         self.train_loss_ = []
         self.val_loss_ = None
+        self.time_spent_ = []
 
-        self.trace_loss_ = trace_loss
-
-        self._val_used = False
         self._fitted = False
 
     def _set_fitted(self):
@@ -79,8 +81,15 @@ class BaseEstimatorUtils:
         """
         if self.val_loss_ is None:
             self.val_loss_ = []
-            self._val_used = True
         if isinstance(loss_value, float):
             self.val_loss_.append(loss_value)
         else:
             self.val_loss_.extend(loss_value)
+
+    def append_time_(self, t):
+        """Adds time spent on one iteration to the storage array
+        """
+        if isinstance(t, float):
+            self.time_spent_.append(t)
+        else:
+            self.time_spent_.extend(t)
