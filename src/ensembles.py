@@ -11,12 +11,13 @@ from .base_estimators import ConstantPredictor, BaseEstimatorUtils
 
 
 class BootstrappedTrees:
-    """Holder for trees and their object subspaces
+    """Holder for trees and their feature and object subspaces
     """
 
     def __init__(self):
         self.trees_ = []
         self.bags_ = []
+        self.subspaces_ = []
 
     @property
     def trees(self):
@@ -42,6 +43,18 @@ class BootstrappedTrees:
         """
         self.bags_ = value
 
+    @property
+    def subspaces(self):
+        """Getter for 'subspaces' field
+        """
+        return self.subspaces_
+
+    @subspaces.setter
+    def subspaces(self, value):
+        """Setter for 'subspaces' field
+        """
+        self.subspaces_ = value
+
 
 class BaseTreeEnsemble(BaseEstimatorUtils):
     def __init__(
@@ -65,15 +78,12 @@ class BaseTreeEnsemble(BaseEstimatorUtils):
             raise ValueError(f'n_trees should be positive integer, got {n_estimators}')
         self.n_estimators = n_estimators
         self.base_tree_ = base_tree
-
-        if feature_subsample_size == 'auto':
-            feature_subsample_size = 1 / 3
-
-        self.trees_parameters = {
-            **trees_parameters,
-            'max_features': feature_subsample_size
-        }
-
+        self.trees_parameters = trees_parameters
+        self.feature_subsample_size = feature_subsample_size
+        if isinstance(feature_subsample_size, float) \
+                and ((feature_subsample_size > 1.) or (feature_subsample_size < 0.)):
+            raise ValueError(f'Expected "feature_subsample_size" to be in [0., 1.], '
+                             f'got {feature_subsample_size}')
         self.max_samples = max_samples
 
         self.estimators_ = BootstrappedTrees()
@@ -81,6 +91,16 @@ class BaseTreeEnsemble(BaseEstimatorUtils):
     def _set_params_fit(self, X):
         if self.random_state is not None:
             np.random.seed(self.random_state)
+        if self.feature_subsample_size == 'auto':
+            self.feature_subsample_size = max(
+                int(np.floor(X.shape[1] / 3)),
+                1
+            )
+        else:
+            self.feature_subsample_size = max(
+                int(np.floor(self.feature_subsample_size * X.shape[1])),
+                1
+            )
 
         if self.max_samples == 'auto':
             bag_size = int(max(
@@ -95,6 +115,12 @@ class BaseTreeEnsemble(BaseEstimatorUtils):
             (self.n_estimators, bag_size),
             replace=True
         )
+
+        self.estimators_.subspaces = [np.random.choice(
+            X.shape[1],
+            self.feature_subsample_size,
+            replace=False
+        ) for _ in range(self.n_estimators)]
 
     def fit(self, X, y):
         """
@@ -180,7 +206,7 @@ class RandomForestMSE(BaseTreeEnsemble):
             require='sharedmem'
         )(delayed(self._parallel_predict)(
             tree.predict,
-            X,
+            X.take(self.estimators_.subspaces[idx], 1),
             pred,
             lock,
             True
@@ -191,7 +217,7 @@ class RandomForestMSE(BaseTreeEnsemble):
     def _fit_tree(self, X, y, idx, lock=None):
         t0 = time.time()
         self.estimators_.trees[idx].fit(
-            X.take(self.estimators_.bags[idx], 0),
+            X.take(self.estimators_.bags[idx], 0).take(self.estimators_.subspaces[idx], 1),
             y[self.estimators_.bags[idx]]
         )
         t0 = time.time() - t0
@@ -260,7 +286,7 @@ class RandomForestMSE(BaseTreeEnsemble):
             require='sharedmem'
         )(delayed(self._parallel_predict)(
             tree.predict,
-            X,
+            X.take(self.estimators_.subspaces[idx], 1),
             [pred],
             lock
         ) for idx, tree in enumerate(self.estimators_.trees))
@@ -313,10 +339,12 @@ class GradientBoostingMSE(BaseTreeEnsemble):
     def _partial_predictions(self, X):
         self._check_if_fitted()
 
-        tree_preds = [
-            tree.predict(X) for tree in
+        tree_preds = [tree.predict(
+            X.take(subspace, 1)
+        ) for subspace, tree in zip(
+            self.estimators_.subspaces,
             self.estimators_.trees
-        ]
+        )]
 
         return self._const_pred.predict(X) + self.learning_rate \
             * np.cumsum(np.multiply(np.array(self._weights)[:, None],
@@ -341,7 +369,7 @@ class GradientBoostingMSE(BaseTreeEnsemble):
 
             self.estimators_.trees.append(self.base_tree_(**self.trees_parameters))
             self.estimators_.trees[idx].fit(
-                X.take(self.estimators_.bags[idx], 0),
+                X.take(self.estimators_.bags[idx], 0).take(self.estimators_.subspaces[idx], 1),
                 (y - curr_target)[self.estimators_.bags[idx]]
             )
 
@@ -349,7 +377,7 @@ class GradientBoostingMSE(BaseTreeEnsemble):
                 t0 = time.time() - t0
                 self.append_time_(t0)
 
-            pred = self.estimators_.trees[idx].predict(X)
+            pred = self.estimators_.trees[idx].predict(X.take(self.estimators_.subspaces[idx], 1))
 
             self._weights.append(minimize_scalar(
                 lambda x, prediction, target: np.linalg.norm(
@@ -385,9 +413,11 @@ class GradientBoostingMSE(BaseTreeEnsemble):
         """
         self._check_if_fitted()
 
-        tree_preds = np.array(
-            [tree.predict(X) for tree
-                in self.estimators_.trees]
-        )
+        tree_preds = np.array([tree.predict(
+            X.take(subspace, 1)
+        ) for subspace, tree in zip(
+            self.estimators_.subspaces,
+            self.estimators_.trees
+        )])
 
         return self._const_pred.predict(X) + self.learning_rate * np.dot(self._weights, tree_preds)
